@@ -28,33 +28,34 @@ FLAGS = flags.FLAGS
 tf.app.flags.DEFINE_boolean('log_device_placement', False,
                             """Whether to log device placement.""")
 #core params..
-flags.DEFINE_string('model', 'graphsage_mean', 'model names. See README for possible values.')  
+flags.DEFINE_string('model', 'graphsage_mean', 'model names. See README for possible values.')
 flags.DEFINE_float('learning_rate', 0.01, 'initial learning rate.')
 flags.DEFINE_string("model_size", "small", "Can be big or small; model specific def'ns")
 flags.DEFINE_string('train_prefix', '', 'prefix identifying training data. must be specified.')
 
-# left to default values in main experiments 
+# left to default values in main experiments
 flags.DEFINE_integer('epochs', 10, 'number of epochs to train.')
-flags.DEFINE_float('dropout', 0.0, 'dropout rate (1 - keep probability).')
+flags.DEFINE_float('dropout', 0.5, 'dropout rate (1 - keep probability).')
 flags.DEFINE_float('weight_decay', 0.0, 'weight for l2 loss on embedding matrix.')
-flags.DEFINE_integer('max_degree', 128, 'maximum node degree.')
+flags.DEFINE_integer('max_degree', 100, 'maximum node degree.')
 flags.DEFINE_integer('samples_1', 25, 'number of samples in layer 1')
 flags.DEFINE_integer('samples_2', 10, 'number of samples in layer 2')
 flags.DEFINE_integer('samples_3', 0, 'number of users samples in layer 3. (Only for mean model)')
-flags.DEFINE_integer('dim_1', 128, 'Size of output dim (final is 2x this, if using concat)')
-flags.DEFINE_integer('dim_2', 128, 'Size of output dim (final is 2x this, if using concat)')
+flags.DEFINE_integer('dim_1', 64, 'Size of output dim (final is 2x this, if using concat)')
+flags.DEFINE_integer('dim_2', 64, 'Size of output dim (final is 2x this, if using concat)')
 flags.DEFINE_boolean('random_context', True, 'Whether to use random context or direct edges')
 flags.DEFINE_integer('batch_size', 512, 'minibatch size.')
-flags.DEFINE_boolean('sigmoid', False, 'whether to use sigmoid loss')
+flags.DEFINE_boolean('sigmoid', True, 'whether to use sigmoid loss')
 flags.DEFINE_integer('identity_dim', 0, 'Set to positive value to use identity embedding features of that dimension. Default 0.')
 
 #logging, saving, validation settings etc.
 flags.DEFINE_string('base_log_dir', '.', 'base directory for logging and saving embeddings')
-flags.DEFINE_integer('validate_iter', 5000, "how often to run a validation minibatch.")
+flags.DEFINE_integer('validate_iter', 500, "how often to run a validation minibatch.")
 flags.DEFINE_integer('validate_batch_size', 256, "how many nodes per validation sample.")
 flags.DEFINE_integer('gpu', 1, "which gpu to use.")
-flags.DEFINE_integer('print_every', 5, "How often to print training info.")
+flags.DEFINE_integer('print_every', 1, "How often to print training info.")
 flags.DEFINE_integer('max_total_steps', 10**10, "Maximum total number of iterations")
+#flags.DEFINE_boolean('save_embeddings', True, 'whether to save embeddings for all nodes after training')
 
 os.environ["CUDA_VISIBLE_DEVICES"]=str(FLAGS.gpu)
 
@@ -76,6 +77,7 @@ def evaluate(sess, model, minibatch_iter, size=None):
     node_outs_val = sess.run([model.preds, model.loss], 
                         feed_dict=feed_dict_val)
     mic, mac = calc_f1(labels, node_outs_val[0])
+    #pdb.set_trace()
     return node_outs_val[1], mic, mac, (time.time() - t_test)
 
 def log_dir():
@@ -93,21 +95,24 @@ def incremental_evaluate(sess, model, minibatch_iter, size, test=False):
     finished = False
     val_losses = []
     val_preds = []
+    embeddings = []
     labels = []
     iter_num = 0
     finished = False
     while not finished:
         feed_dict_val, batch_labels, finished, _  = minibatch_iter.incremental_node_val_feed_dict(size, iter_num, test=test)
-        node_outs_val = sess.run([model.preds, model.loss], 
+        node_outs_val = sess.run([model.preds, model.loss, model.outputs1],
                          feed_dict=feed_dict_val)
         val_preds.append(node_outs_val[0])
         labels.append(batch_labels)
         val_losses.append(node_outs_val[1])
+        embeddings.append(node_outs_val[2])
         iter_num += 1
     val_preds = np.vstack(val_preds)
     labels = np.vstack(labels)
+    embeddings = np.vstack(embeddings)
     f1_scores = calc_f1(labels, val_preds)
-    return np.mean(val_losses), f1_scores[0], f1_scores[1], (time.time() - t_test)
+    return np.mean(val_losses), f1_scores[0], f1_scores[1], (time.time() - t_test), val_preds, labels, embeddings
 
 def construct_placeholders(num_classes):
     # Define placeholders
@@ -118,6 +123,33 @@ def construct_placeholders(num_classes):
         'batch_size' : tf.placeholder(tf.int32, name='batch_size'),
     }
     return placeholders
+
+# def save_val_embeddings(sess, model, minibatch_iter, size, out_dir, mod=""):
+#     val_embeddings = []
+#     finished = False
+#     seen = set([])
+#     nodes = []
+#     iter_num = 0
+#     name = "val"
+#     while not finished:
+#         feed_dict_val, finished, edges = minibatch_iter.incremental_embed_feed_dict(size, iter_num)
+#         iter_num += 1
+#         #pdb.set_trace()
+#         outs_val = sess.run([model.loss, model.preds, model.outputs1],
+#                             feed_dict=feed_dict_val[0])
+#         #ONLY SAVE FOR embeds1 because of planetoid
+#         for i, edge in enumerate(edges):
+#             if not edge[0] in seen:
+#                 val_embeddings.append(outs_val[-1][i,:])
+#                 nodes.append(edge[0])
+#                 seen.add(edge[0])
+#     if not os.path.exists(out_dir):
+#         os.makedirs(out_dir)
+#     val_embeddings = np.vstack(val_embeddings)
+#     np.save(out_dir + name + mod + ".npy",  val_embeddings)
+#     with open(out_dir + name + mod + ".txt", "w") as fp:
+#         fp.write("\n".join(map(str,nodes)))
+
 
 def train(train_data, test_data=None):
 
@@ -279,7 +311,7 @@ def train(train_data, test_data=None):
                 # Validation
                 sess.run(val_adj_info.op)
                 if FLAGS.validate_batch_size == -1:
-                    val_cost, val_f1_mic, val_f1_mac, duration = incremental_evaluate(sess, model, minibatch, FLAGS.batch_size)
+                    val_cost, val_f1_mic, val_f1_mac, duration, val_preds, labels, embeddings = incremental_evaluate(sess, model, minibatch, FLAGS.batch_size)
                 else:
                     val_cost, val_f1_mic, val_f1_mac, duration = evaluate(sess, model, minibatch, FLAGS.validate_batch_size)
                 sess.run(train_adj_info.op)
@@ -313,7 +345,7 @@ def train(train_data, test_data=None):
     
     print("Optimization Finished!")
     sess.run(val_adj_info.op)
-    val_cost, val_f1_mic, val_f1_mac, duration = incremental_evaluate(sess, model, minibatch, FLAGS.batch_size)
+    val_cost, val_f1_mic, val_f1_mac, duration, val_preds, val_labels, embeddings = incremental_evaluate(sess, model, minibatch, FLAGS.batch_size)
     print("Full validation stats:",
                   "loss=", "{:.5f}".format(val_cost),
                   "f1_micro=", "{:.5f}".format(val_f1_mic),
@@ -323,11 +355,23 @@ def train(train_data, test_data=None):
         fp.write("loss={:.5f} f1_micro={:.5f} f1_macro={:.5f} time={:.5f}".
                 format(val_cost, val_f1_mic, val_f1_mac, duration))
 
+    np.save(log_dir() +"val_preds.npy", val_preds)
+    np.save(log_dir() + "val_labels.npy", val_labels)
+
     print("Writing test set stats to file (don't peak!)")
-    val_cost, val_f1_mic, val_f1_mac, duration = incremental_evaluate(sess, model, minibatch, FLAGS.batch_size, test=True)
+    val_cost, val_f1_mic, val_f1_mac, duration, test_preds, test_labels, test_embeddings = incremental_evaluate(sess, model, minibatch, FLAGS.batch_size, test=True)
     with open(log_dir() + "test_stats.txt", "w") as fp:
         fp.write("loss={:.5f} f1_micro={:.5f} f1_macro={:.5f}".
                 format(val_cost, val_f1_mic, val_f1_mac))
+
+    print("Writing test set predictions to file")
+    np.save(log_dir() + "test_preds.npy", test_preds)
+    np.save(log_dir() + "test_labels.npy", test_labels)
+
+    #if FLAGS.save_embeddings:
+    print("Writing embeddings to file")
+    np.save(log_dir() + "embeddings.npy", embeddings)
+    np.save(log_dir() + "test_embeddings.npy", test_embeddings)
 
 def main(argv=None):
     print("Loading training data..")
